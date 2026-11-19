@@ -1,0 +1,13 @@
+{
+  "name": "Wochenplan – Was koche ich diese Woche?",
+  "short_name": "Wochenplan",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#FBF7F2",
+  "theme_color": "#D9643A",
+  "lang": "de",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

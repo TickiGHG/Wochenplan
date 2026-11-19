@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wochenplan Tests</title>
+  <style>
+    body { font: 15px/1.4 system-ui, sans-serif; padding: 16px; background: #fff; color: #111; }
+    .pass { color: #1a7f37; } .fail { color: #b3261e; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h1>Logik-Tests</h1>
+  <p id="summary">läuft …</p>
+  <ul id="out"></ul>
+
+  <script src="js/storage.js"></script>
+  <script src="js/classify.js"></script>
+  <script src="js/recipes-builtin.js"></script>
+  <script src="js/mealdb.js"></script>
+  <script src="js/translate.js"></script>
+  <script src="js/recipes.js"></script>
+  <script src="js/images.js"></script>
+  <script src="js/planner.js"></script>
+  <script src="js/shopping.js"></script>
+  <script>
+    // Mini-Testframework: test(name, fn) – fn wirft bei Fehler
+    const results = [];
+    function test(name, fn) {
+      try { fn(); results.push([true, name]); } catch (e) { results.push([false, name + ' → ' + e.message]); }
+    }
+    function eq(a, b, msg = '') {
+      if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`${msg} erwartet ${JSON.stringify(b)}, war ${JSON.stringify(a)}`);
+    }
+    function ok(v, msg) { if (!v) throw new Error(msg || 'nicht wahr'); }
+
+    const recipe = names => ({ ingredients: names.map(n => ({ name: n })) });
+    const an = names => Classify.analyzeRecipe(recipe(names));
+    // Nur eingebaute Rezepte, damit Tests unabhängig von TheMealDB/eigenen Rezepten sind
+    const ALL = RecipeDB.all().filter(r => r.source === 'builtin');
+    const S = o => Planner.withDefaults(o);
+
+    // ---------------- Klassifizierung ----------------
+    test('Ei wird erkannt, Reis/Zwiebel nicht', () => {
+      eq(an(['Ei']).flags.eggFree, false);
+      eq(an(['Eier']).flags.eggFree, false);
+      eq(an(['Reis', 'Zwiebel', 'Weizenmehl']).flags.eggFree, true);
+      eq(an(['Mie-Nudeln, eifrei']).flags.eggFree, true);
+      eq(an(['eggplant']).flags.eggFree, true);
+    });
+    test('Kokosmilch / Erdnussbutter sind keine Milchprodukte', () => {
+      eq(an(['Kokosmilch', 'Erdnussbutter']).flags.lactoseFree, true);
+      eq(an(['Sahne']).flags.lactoseFree, false);
+    });
+    test('Muskatnuss ist keine Nuss, Erdnussbutter schon', () => {
+      eq(an(['Muskatnuss']).flags.nutFree, true);
+      eq(an(['Erdnussbutter']).flags.nutFree, false);
+    });
+    test('mehligkochende Kartoffeln sind glutenfrei', () => {
+      eq(an(['mehligkochende Kartoffeln']).flags.glutenFree, true);
+      eq(an(['Weizenmehl']).flags.glutenFree, false);
+      eq(an(['Reisbandnudeln']).flags.glutenFree, true);
+    });
+    test('Tamarinde ist kein Rind, Kichererbse kein Huhn', () => {
+      eq(an(['Tamarindenpaste', 'Kichererbsen']).proteins, []);
+    });
+    test('Fischsauce: nicht vegetarisch, aber Hähnchen bleibt Hauptzutat', () => {
+      const r = an(['Hähnchenbrustfilet', 'Fischsauce']);
+      eq(r.mainProtein, 'gefluegel');
+      ok(r.proteins.includes('fisch'), 'fisch fehlt in proteins');
+      eq(an(['Tofu', 'Fischsauce']).flags.vegetarian, false);
+    });
+    test('vegan nur ohne Milch, Ei, Honig', () => {
+      eq(an(['Linsen', 'Honig']).flags.vegan, false);
+      eq(an(['Linsen', 'Tomaten']).flags.vegan, true);
+    });
+    test('alle eingebauten Rezepte haben Zutaten und Schritte', () => {
+      for (const r of ALL) { ok(r.ingredients.length >= 3, r.name); ok(r.steps.length >= 3, r.name); ok(r.time > 0, r.name); }
+    });
+    test('IDs der eingebauten Rezepte sind eindeutig', () => {
+      eq(new Set(ALL.map(r => r.id)).size, ALL.length);
+    });
+
+    // ---------------- Filter ----------------
+    test('vegetarisch-Filter lässt nur vegetarische Rezepte durch', () => {
+      ok(Planner.filterRecipes(ALL, S({ diet: 'vegetarisch' })).every(r => r.flags.vegetarian));
+    });
+    test('Zutaten ausschließen (Pilze/Champignons)', () => {
+      const list = Planner.filterRecipes(ALL, S({ excludeIngredients: 'champignon' }));
+      ok(!list.some(r => r.name === 'Pilzrisotto'));
+    });
+    test('Schwein ausschließen entfernt auch Lasagne (Hackfleisch gemischt)', () => {
+      const list = Planner.filterRecipes(ALL, S({ excludeProteins: ['schwein'] }));
+      ok(!list.some(r => r.name === 'Lasagne'));
+    });
+    test('Küchen-Filter', () => {
+      ok(Planner.filterRecipes(ALL, S({ cuisines: ['Indisch'] })).every(r => r.cuisine === 'Indisch'));
+    });
+
+    // ---------------- Wochenplan ----------------
+    test('Standard: 7 verschiedene Gerichte, ≥2 vegetarisch, Mo–Fr ≤45 Min, keine Warnungen (300 Seeds)', () => {
+      for (let seed = 1; seed <= 300; seed++) {
+        const p = Planner.generateWeek({ recipes: ALL, settings: S({}), rng: Planner.seededRng(seed) });
+        const rs = p.days.map(d => ALL.find(r => r.id === d.recipeId));
+        ok(rs.every(Boolean), 'leerer Tag bei Seed ' + seed);
+        eq(new Set(rs.map(r => r.id)).size, 7, 'Seed ' + seed);
+        ok(rs.filter(r => r.flags.vegetarian).length >= 2, 'veg Seed ' + seed);
+        ok(rs.slice(0, 5).every(r => r.time <= 45), 'Zeit Seed ' + seed);
+        for (let i = 1; i < 7; i++) ok(rs[i].cuisine !== rs[i - 1].cuisine, 'Küche doppelt Seed ' + seed);
+        eq(p.warnings, [], 'Seed ' + seed);
+      }
+    });
+    test('nur ausgewählte Tage werden geplant', () => {
+      const p = Planner.generateWeek({ recipes: ALL, settings: S({ days: [true, false, true, false, true, false, false] }), rng: Planner.seededRng(1) });
+      eq(p.days.map(d => !!d.recipeId), [true, false, true, false, true, false, false]);
+    });
+    test('gesperrte Tage bleiben beim Neu-Würfeln', () => {
+      const first = Planner.generateWeek({ recipes: ALL, settings: S({}), rng: Planner.seededRng(5) });
+      first.days[2].locked = true;
+      const second = Planner.generateWeek({ recipes: ALL, settings: S({}), previous: first, rng: Planner.seededRng(99) });
+      eq(second.days[2].recipeId, first.days[2].recipeId);
+    });
+    test('Rezepte der Vorwochen werden nicht wiederholt', () => {
+      const recent = Planner.generateWeek({ recipes: ALL, settings: S({}), rng: Planner.seededRng(3) }).days.map(d => d.recipeId);
+      const p = Planner.generateWeek({ recipes: ALL, settings: S({}), recentIds: recent, rng: Planner.seededRng(4) });
+      ok(!p.days.some(d => recent.includes(d.recipeId)));
+    });
+    test('blockierte Rezepte kommen nie', () => {
+      const blocked = ALL.slice(0, 30).map(r => r.id);
+      for (let seed = 1; seed < 30; seed++) {
+        const p = Planner.generateWeek({ recipes: ALL, settings: S({}), blocked, rng: Planner.seededRng(seed) });
+        ok(!p.days.some(d => blocked.includes(d.recipeId)), 'Seed ' + seed);
+      }
+    });
+    test('zu strenge Filter: leere Tage + Warnung statt Absturz', () => {
+      const p = Planner.generateWeek({ recipes: ALL, settings: S({ diet: 'vegan', glutenFree: true, cuisines: ['Indisch'] }), rng: Planner.seededRng(1) });
+      ok(p.warnings.length > 0);
+      ok(p.days.filter(d => d.recipeId).length <= 2);
+    });
+    test('Tag neu würfeln ändert nur diesen Tag', () => {
+      const p = Planner.generateWeek({ recipes: ALL, settings: S({}), rng: Planner.seededRng(7) });
+      const res = Planner.rerollDay({ recipes: ALL, settings: S({}), plan: p, dayIndex: 3, rng: Planner.seededRng(8) });
+      for (let i = 0; i < 7; i++) if (i !== 3) eq(res.plan.days[i].recipeId, p.days[i].recipeId);
+      ok(res.plan.days[3].recipeId !== p.days[3].recipeId, 'gleiches Rezept');
+      ok(!p.days.some((d, i) => i !== 3 && d.recipeId === res.plan.days[3].recipeId), 'Duplikat');
+    });
+
+    test('höchstens X Online-Rezepte pro Woche, auch wenn es viel mehr davon gibt', () => {
+      // 10 Kopien jedes eingebauten Rezepts als "TheMealDB"-Rezepte → Online-Rezepte in der Überzahl
+      const fake = [];
+      for (let k = 0; k < 10; k++) for (const r of ALL) fake.push({ ...r, id: 'm-' + k + r.id, source: 'mealdb', cuisine: r.cuisine + k });
+      const mixed = [...ALL, ...fake];
+      for (let seed = 1; seed <= 50; seed++) {
+        const p = Planner.generateWeek({ recipes: mixed, settings: S({ maxOnlinePerWeek: 2 }), rng: Planner.seededRng(seed) });
+        ok(p.days.filter(d => d.recipeId.startsWith('m-')).length <= 2, 'Seed ' + seed);
+      }
+      const none = Planner.generateWeek({ recipes: mixed, settings: S({ maxOnlinePerWeek: 0 }), rng: Planner.seededRng(1) });
+      ok(!none.days.some(d => d.recipeId.startsWith('m-')));
+    });
+
+    // ---------------- Bilder ----------------
+    test('jedes Wikimedia-Foto gehört zu einem existierenden eingebauten Rezept', () => {
+      const names = new Set(ALL.map(r => r.name));
+      for (const n of Object.keys(Images.WIKI_IMAGES)) ok(names.has(n), 'unbekannt: ' + n);
+    });
+    test('Bildauswahl: Wikimedia, TheMealDB, Platzhalter, eigene Version erbt Foto', () => {
+      const bolo = ALL.find(r => r.name === 'Spaghetti Bolognese');
+      const p = Images.forRecipe(bolo, 'small');
+      eq(p.kind, 'photo');
+      ok(p.src.includes('/330px-'), p.src);
+      ok(p.credit.text.includes('CC BY-SA 3.0'));
+      eq(Images.forRecipe(ALL.find(r => r.name === 'Chili sin Carne')).kind, 'placeholder');
+      const m = Images.forRecipe({ id: 'm-1', name: 'X', image: 'https://www.themealdb.com/images/media/meals/a.jpg', tags: [], cuisine: 'Thai' }, 'small');
+      ok(m.src.endsWith('/small'), m.src);
+      const copy = { id: 'c-1', name: 'Meine Bolo', baseRecipe: bolo.id, tags: [], cuisine: 'Italienisch' };
+      eq(Images.forRecipe(copy).kind, 'photo');
+    });
+
+    // ---------------- Übersetzung ----------------
+    test('Übersetzung wird über das Rezept gelegt, Original bleibt erhalten', () => {
+      const en = { id: 'm-1', name: 'Beef Stew', ingredients: [{ amount: 2, unit: 'cups', name: 'Beef' }], steps: ['Cook it.'], lang: 'en' };
+      const de = Translate.apply(en, { name: 'Rindfleischeintopf', ingredients: ['Rindfleisch'], units: ['Tassen'], steps: ['Kochen.'], provider: 'Test' });
+      eq(de.name, 'Rindfleischeintopf');
+      eq(de.ingredients[0], { amount: 2, unit: 'Tassen', name: 'Rindfleisch' });
+      eq(de.steps, ['Kochen.']);
+      eq(de.lang, 'de');
+      eq(de.original.name, 'Beef Stew');
+      eq(Translate.apply(en, null), en); // ohne Übersetzung unverändert
+    });
+    test('Einheiten-Liste deckt häufige englische Einheiten ab', () => {
+      for (const u of ['cup', 'tbsp', 'tsp', 'pinch', 'cloves', 'to taste']) ok(Translate.UNITS[u], 'fehlt: ' + u);
+    });
+
+    // ---------------- Kalenderwochen ----------------
+    test('ISO-Kalenderwochen', () => {
+      eq(Planner.weekKey(new Date(2026, 10, 19)), '2026-W47');
+      eq(Planner.weekKey(new Date(2027, 0, 1)), '2026-W53');   // 1.1.2027 ist Freitag → gehört zu KW 53/2026
+      eq(Planner.weekKey(new Date(2026, 0, 1)), '2026-W01');
+      eq(Planner.addWeeks('2026-W53', 1), '2027-W01');
+      eq(Planner.addWeeks('2026-W01', -1), '2025-W52');
+      eq(Planner.weekMonday('2026-W47').getDate(), 16);
+    });
+
+    // ---------------- Einkaufsliste ----------------
+    test('Einkaufsliste rechnet Portionen um und fasst zusammen', () => {
+      const a = { id: 'a', name: 'A', servings: 4, ingredients: [{ amount: 2, unit: 'Stück', name: 'Zwiebel' }, { amount: 500, unit: 'g', name: 'Mehl' }] };
+      const b = { id: 'b', name: 'B', servings: 2, ingredients: [{ amount: 1, unit: 'Stück', name: 'Zwiebel' }, { amount: 1, unit: 'kg', name: 'Mehl' }, { amount: null, unit: '', name: 'Salz und Pfeffer' }] };
+      const map = { a, b };
+      const list = Shopping.build({ days: [{ recipeId: 'a' }, { recipeId: 'b' }] }, id => map[id], 2, 'Salz, Pfeffer');
+      const zw = list.find(i => i.name === 'Zwiebel');
+      eq(zw.amount, 2);                       // 1 (A halbiert) + 1 (B)
+      eq(list.find(i => i.name === 'Mehl').amount, 1250); // 250 g + 1000 g
+      eq(list.find(i => i.name === 'Salz und Pfeffer').pantry, true);
+      eq(Shopping.formatAmount(1250, 'g'), '1,25 kg');
+      eq(Shopping.formatAmount(1.5, 'Stück'), '1½ Stück');
+      eq(Shopping.formatAmount(0.5, 'Bund'), '½ Bund');
+    });
+
+    // ---------------- Parser ----------------
+    test('TheMealDB-Mengen werden gelesen', () => {
+      eq(MealDB.parseMeasure('1 1/2 cups'), { amount: 1.5, unit: 'cups' });
+      eq(MealDB.parseMeasure('200g'), { amount: 200, unit: 'g' });
+      eq(MealDB.parseMeasure('½ tsp'), { amount: 0.5, unit: 'tsp' });
+      eq(MealDB.parseMeasure('To taste'), { amount: null, unit: 'To taste' });
+    });
+    test('Zutatenzeilen im Formular werden gelesen', () => {
+      eq(RecipeDB.parseIngredientLine('200 g Mehl'), { amount: 200, unit: 'g', name: 'Mehl' });
+      eq(RecipeDB.parseIngredientLine('2 Eier'), { amount: 2, unit: '', name: 'Eier' });
+      eq(RecipeDB.parseIngredientLine('1/2 TL Salz'), { amount: 0.5, unit: 'TL', name: 'Salz' });
+      eq(RecipeDB.parseIngredientLine('Pfeffer'), { amount: null, unit: '', name: 'Pfeffer' });
+      eq(RecipeDB.parseIngredientLine('1,5 kg Kartoffeln'), { amount: 1.5, unit: 'kg', name: 'Kartoffeln' });
+    });
+
+    // ---------------- Ausgabe ----------------
+    const failed = results.filter(r => !r[0]).length;
+    document.getElementById('summary').innerHTML = failed
+      ? `<span class="fail">${failed} von ${results.length} Tests fehlgeschlagen</span>`
+      : `<span class="pass">Alle ${results.length} Tests bestanden ✔</span>`;
+    document.getElementById('out').innerHTML = results.map(([p, n]) => `<li class="${p ? 'pass' : 'fail'}">${p ? '✔' : '✘'} ${n}</li>`).join('');
+    window.TEST_RESULTS = { failed, total: results.length, failures: results.filter(r => !r[0]).map(r => r[1]) };
+  </script>
+</body>
+</html>
